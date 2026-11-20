@@ -118,7 +118,7 @@ class MainActivity : Activity() {
         scroll = ScrollView(this).apply {
             isFillViewport = true
             addView(output)
-            fillViewport = true
+            isFillViewport = true
         }
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
 
