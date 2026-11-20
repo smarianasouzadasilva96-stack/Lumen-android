@@ -1,7 +1,12 @@
 package com.lumen.terminal
 
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.text.SpannableString
 import android.text.Spanned
@@ -9,246 +14,312 @@ import android.text.style.ForegroundColorSpan
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
-import android.view.ViewGroup.LayoutParams.MATCH_PARENT
-import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
-import android.widget.EditText
-import android.widget.LinearLayout
-import android.widget.ScrollView
-import android.widget.TextView
+import android.widget.*
 import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
 
-private const val APP_NAME = "Lumen"
-private const val VERSION = "1.0"
-private const val COMMAND_TIMEOUT_S = 60L
-private const val HISTORY_LIMIT = 500
-
-// Shell do próprio Android. Em Android não existe /bin/sh garantido.
-private const val SHELL = "/system/bin/sh"
-
-// Paleta própria do Lumen
-private val COLOR_BG = 0xFF0B0F14.toInt()
-private val COLOR_PANEL = 0xFF111820.toInt()
-private val COLOR_FG = 0xFFBFF5D8.toInt()
-private val COLOR_ACCENT = 0xFF7CF2B0.toInt()
-private val COLOR_DIM = 0xFF3A5A4B.toInt()
-private val COLOR_ERR = 0xFFFF8A7A.toInt()
-
+/**
+ * Lumen Terminal — independent Android shell console.
+ * Uses Android's /system/bin/sh, NOT the Termux bootstrap or package manager.
+ */
 class MainActivity : Activity() {
-
-    // Uma única thread de trabalho mantém a ordem dos comandos.
-    private val worker = Executors.newSingleThreadExecutor()
+    private val bg = Color.rgb(9, 13, 18)
+    private val panel = Color.rgb(17, 24, 32)
+    private val accent = Color.rgb(91, 236, 169)
+    private val fg = Color.rgb(213, 235, 226)
+    private val muted = Color.rgb(115, 141, 136)
+    private val danger = Color.rgb(255, 139, 130)
+    private val executor = Executors.newSingleThreadExecutor()
     private val history = mutableListOf<String>()
-    private var historyPos = 0
+    private var historyIndex = 0
     private lateinit var cwd: File
-
-    private lateinit var screen: TextView
+    private lateinit var output: TextView
     private lateinit var scroll: ScrollView
-    private lateinit var prompt: TextView
-    private lateinit var input: EditText
-
-    private data class Outcome(val output: String, val code: Int)
+    private lateinit var entry: EditText
+    private lateinit var location: TextView
+    private lateinit var status: TextView
+    private var fontSize = 13f
+    private var running = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         cwd = filesDir
-        window.statusBarColor = COLOR_BG
-        window.navigationBarColor = COLOR_PANEL
+        window.statusBarColor = bg
+        window.navigationBarColor = bg
+        fontSize = getPreferences(MODE_PRIVATE).getFloat("fontSize", 13f)
+        buildInterface()
+        write("LUMEN TERMINAL  •  v2.0\n", accent)
+        write("Android shell /system/bin/sh  •  ambiente local\n", muted)
+        write("Digite help para ver os comandos disponíveis.\n\n")
+        refreshLocation()
+    }
 
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(COLOR_BG)
-            setPadding(dp(12), dp(12), dp(12), dp(8))
+    private fun rounded(color: Int, radius: Float = 16f): GradientDrawable =
+        GradientDrawable().apply { setColor(color); cornerRadius = dp(radius).toFloat() }
+
+    private fun dp(v: Float): Int = (v * resources.displayMetrics.density).toInt()
+    private fun label(text: String, color: Int = fg, size: Float = 13f): TextView =
+        TextView(this).apply {
+            this.text = text
+            setTextColor(color)
+            textSize = size
+            typeface = Typeface.create("monospace", Typeface.NORMAL)
+            gravity = Gravity.CENTER_VERTICAL
         }
 
-        root.addView(TextView(this).apply {
-            text = "◖ $APP_NAME ◗   v$VERSION"
-            setTextColor(COLOR_ACCENT)
-            typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
-            textSize = 14f
-            setPadding(0, 0, 0, dp(8))
+    private fun buildInterface() {
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(bg)
+            setPadding(dp(14f), dp(12f), dp(14f), dp(8f))
+        }
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(4f), dp(4f), dp(4f), dp(12f))
+        }
+        val mark = label("◈", accent, 27f)
+        header.addView(mark, LinearLayout.LayoutParams(dp(42f), dp(45f)))
+        val identity = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        identity.addView(label("L U M E N", fg, 18f).apply {
+            typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
         })
+        identity.addView(label("TERMINAL  /  ANDROID", muted, 10f))
+        header.addView(identity, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        val menu = label("⋮", fg, 27f).apply {
+            gravity = Gravity.CENTER
+            setOnClickListener { showMenu(it) }
+            contentDescription = "Opções do terminal"
+        }
+        header.addView(menu, LinearLayout.LayoutParams(dp(40f), dp(45f)))
+        root.addView(header)
 
-        screen = TextView(this).apply {
-            setTextColor(COLOR_FG)
-            typeface = Typeface.MONOSPACE
-            textSize = 13f
+        val info = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = rounded(panel, 12f)
+            setPadding(dp(12f), dp(10f), dp(12f), dp(10f))
+        }
+        status = label("●  PRONTO", accent, 11f)
+        info.addView(status)
+        location = label("~", muted, 11f).apply { gravity = Gravity.END; maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.START }
+        info.addView(location, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        root.addView(info)
+
+        output = label("", fg, fontSize).apply {
             setTextIsSelectable(true)
+            setPadding(dp(6f), dp(18f), dp(6f), dp(14f))
+            gravity = Gravity.TOP or Gravity.START
+            setLineSpacing(dp(3f).toFloat(), 1f)
         }
         scroll = ScrollView(this).apply {
             isFillViewport = true
-            addView(screen)
+            addView(output)
+            fillViewport = true
         }
-        root.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
 
-        val footer = LinearLayout(this).apply {
+        val keys = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setBackgroundColor(COLOR_PANEL)
-            setPadding(dp(10), dp(6), dp(10), dp(6))
+            setPadding(0, dp(4f), 0, dp(10f))
         }
-
-        prompt = TextView(this).apply {
-            setTextColor(COLOR_ACCENT)
-            typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
-            textSize = 13f
-            setPadding(0, 0, dp(8), 0)
+        val keySpecs = listOf("ESC", "TAB", "CTRL", "↑", "↓", "/", "-", "|")
+        keySpecs.forEach { key ->
+            val b = label(key, accent, 11f).apply {
+                gravity = Gravity.CENTER
+                background = rounded(panel, 9f)
+                setOnClickListener { quickKey(key) }
+                setOnLongClickListener { if (key == "CTRL") { write("CTRL: use teclado externo para combinações.\n", muted); true } else false }
+            }
+            val p = LinearLayout.LayoutParams(0, dp(38f), 1f)
+            p.setMargins(dp(2f), 0, dp(2f), 0)
+            keys.addView(b, p)
         }
+        root.addView(keys)
 
-        input = EditText(this).apply {
-            setTextColor(COLOR_FG)
-            setHintTextColor(COLOR_DIM)
-            hint = "comando"
-            typeface = Typeface.MONOSPACE
-            textSize = 13f
-            background = null
+        val inputRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = rounded(panel, 14f)
+            setPadding(dp(12f), dp(4f), dp(6f), dp(4f))
+        }
+        inputRow.addView(label("❯", accent, 19f))
+        entry = EditText(this).apply {
             setSingleLine(true)
+            setTextColor(fg)
+            setHintTextColor(muted)
+            hint = "Digite um comando..."
+            textSize = fontSize
+            typeface = Typeface.MONOSPACE
+            background = null
             imeOptions = EditorInfo.IME_ACTION_SEND
             setOnEditorActionListener { _, actionId, event ->
-                val enterPressed = event?.keyCode == KeyEvent.KEYCODE_ENTER &&
-                    event.action == KeyEvent.ACTION_DOWN
-                if (actionId == EditorInfo.IME_ACTION_SEND || enterPressed) {
-                    submit()
-                    true
-                } else {
-                    false
-                }
+                if (actionId == EditorInfo.IME_ACTION_SEND ||
+                    (event?.keyCode == KeyEvent.KEYCODE_ENTER && event.action == KeyEvent.ACTION_DOWN)) {
+                    submit(); true
+                } else false
             }
-            setOnKeyListener { _, keyCode, event ->
-                if (event.action != KeyEvent.ACTION_DOWN) return@setOnKeyListener false
-                when (keyCode) {
-                    KeyEvent.KEYCODE_DPAD_UP -> { recallHistory(-1); true }
-                    KeyEvent.KEYCODE_DPAD_DOWN -> { recallHistory(1); true }
+            setOnKeyListener { _, code, event ->
+                if (event.action != KeyEvent.ACTION_DOWN) false
+                else when (code) {
+                    KeyEvent.KEYCODE_DPAD_UP -> { recall(-1); true }
+                    KeyEvent.KEYCODE_DPAD_DOWN -> { recall(1); true }
                     else -> false
                 }
             }
         }
-
-        footer.addView(prompt)
-        footer.addView(input, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-        root.addView(footer)
+        inputRow.addView(entry, LinearLayout.LayoutParams(0, dp(52f), 1f))
+        val send = label("↵", bg, 23f).apply {
+            gravity = Gravity.CENTER
+            background = rounded(accent, 10f)
+            contentDescription = "Executar comando"
+            setOnClickListener { submit() }
+        }
+        inputRow.addView(send, LinearLayout.LayoutParams(dp(46f), dp(42f)))
+        root.addView(inputRow)
         setContentView(root)
-
-        append("$APP_NAME $VERSION\n", COLOR_ACCENT)
-        append("comandos internos: cd <pasta>, clear, exit\n\n", COLOR_DIM)
-        refreshPrompt()
-        input.requestFocus()
     }
 
-    override fun onDestroy() {
-        worker.shutdownNow()
-        super.onDestroy()
-    }
-
-    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
-
-    private fun folderName(dir: File): String = dir.name.ifEmpty { "/" }
-
-    private fun refreshPrompt() {
-        prompt.text = "${folderName(cwd)} ❯"
-    }
-
-    private fun append(text: String, color: Int = COLOR_FG) {
-        val span = SpannableString(text)
-        span.setSpan(ForegroundColorSpan(color), 0, text.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-        screen.append(span)
-        scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
-    }
-
-    private fun clearScreen() {
-        screen.text = ""
-    }
-
-    private fun submit() {
-        val line = input.text.toString().trim()
-        input.setText("")
-        if (line.isEmpty()) return
-
-        history.add(line)
-        if (history.size > HISTORY_LIMIT) history.removeAt(0)
-        historyPos = history.size
-
-        append("${folderName(cwd)} ❯ $line\n", COLOR_ACCENT)
-
-        when (line.substringBefore(' ')) {
-            "clear", "cls" -> clearScreen()
-            "exit" -> finish()
-            "cd" -> changeDir(line.substringAfter(' ', "").trim())
-            else -> runCommand(line)
+    private fun showMenu(anchor: View) {
+        val items = arrayOf("Nova sessão (limpar)", "Copiar saída", "Colar", "Aumentar fonte", "Diminuir fonte", "Sobre o Lumen")
+        PopupMenu(this, anchor).apply {
+            items.forEachIndexed { i, title -> menu.add(0, i, i, title) }
+            setOnMenuItemClickListener {
+                when (it.itemId) {
+                    0 -> { output.text = ""; cwd = filesDir; refreshLocation() }
+                    1 -> {
+                        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        clipboard.setPrimaryClip(ClipData.newPlainText("Lumen", output.text))
+                        Toast.makeText(this@MainActivity, "Saída copiada", Toast.LENGTH_SHORT).show()
+                    }
+                    2 -> {
+                        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        val pasted = clipboard.primaryClip?.getItemAt(0)?.coerceToText(this@MainActivity)?.toString().orEmpty()
+                        entry.text.insert(entry.selectionStart.coerceAtLeast(0), pasted)
+                    }
+                    3 -> changeFont(1f)
+                    4 -> changeFont(-1f)
+                    5 -> android.app.AlertDialog.Builder(this@MainActivity)
+                        .setTitle("Lumen Terminal 2.0")
+                        .setMessage("Terminal Android com identidade visual própria. Usa o shell nativo do Android. Não inclui apt, pkg ou o ambiente Linux do Termux.")
+                        .setPositiveButton("Entendi", null).show()
+                }
+                true
+            }
+            show()
         }
     }
 
-    private fun changeDir(raw: String) {
+    private fun changeFont(delta: Float) {
+        fontSize = (fontSize + delta).coerceIn(10f, 22f)
+        output.textSize = fontSize
+        entry.textSize = fontSize
+        getPreferences(MODE_PRIVATE).edit().putFloat("fontSize", fontSize).apply()
+    }
+
+    private fun quickKey(key: String) {
+        when (key) {
+            "↑" -> recall(-1)
+            "↓" -> recall(1)
+            "ESC" -> entry.setText("")
+            "CTRL" -> Toast.makeText(this, "CTRL disponível com teclado físico", Toast.LENGTH_SHORT).show()
+            "TAB" -> entry.text.insert(entry.selectionStart.coerceAtLeast(0), "    ")
+            else -> entry.text.insert(entry.selectionStart.coerceAtLeast(0), key)
+        }
+        entry.requestFocus()
+    }
+
+    private fun recall(step: Int) {
+        if (history.isEmpty()) return
+        historyIndex = (historyIndex + step).coerceIn(0, history.size)
+        val value = if (historyIndex == history.size) "" else history[historyIndex]
+        entry.setText(value)
+        entry.setSelection(value.length)
+    }
+
+    private fun refreshLocation() {
+        location.text = cwd.absolutePath.replace(filesDir.absolutePath, "~")
+    }
+
+    private fun write(value: String, color: Int = fg) {
+        if (value.isEmpty()) return
+        val safe = if (value.length > 120000) value.takeLast(120000) else value
+        val span = SpannableString(safe)
+        span.setSpan(ForegroundColorSpan(color), 0, safe.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        output.append(span)
+        if (output.length() > 180000) output.text = output.text.subSequence(output.length() - 120000, output.length())
+        scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+    }
+
+    private fun submit() {
+        val command = entry.text.toString().trim()
+        if (command.isEmpty()) return
+        if (running) { Toast.makeText(this, "Aguarde o comando atual", Toast.LENGTH_SHORT).show(); return }
+        entry.setText("")
+        history.add(command)
+        if (history.size > 300) history.removeAt(0)
+        historyIndex = history.size
+        write("❯ $command\n", accent)
+        when (command.substringBefore(' ')) {
+            "clear", "cls" -> output.text = ""
+            "exit" -> finish()
+            "help" -> write("Comandos Lumen: help, clear, cd, pwd, history, about, exit\nComandos Android: ls, cat, echo, date, uname, getprop, sh...\nO Lumen não inclui pkg/apt.\n", muted)
+            "about" -> write("Lumen Terminal 2.0 • Android shell\n", muted)
+            "history" -> write(history.mapIndexed { i, s -> "${i + 1}  $s" }.joinToString("\n") + "\n")
+            "pwd" -> write(cwd.absolutePath + "\n")
+            "cd" -> changeDirectory(command.substringAfter(' ', "").trim())
+            else -> execute(command)
+        }
+    }
+
+    private fun changeDirectory(raw: String) {
         val target = runCatching {
             when {
-                raw.isEmpty() || raw == "~" -> filesDir
+                raw.isBlank() || raw == "~" -> filesDir
                 raw.startsWith("/") -> File(raw)
                 else -> File(cwd, raw)
             }.canonicalFile
         }.getOrNull()
-
-        if (target != null && target.isDirectory) {
-            cwd = target
-            refreshPrompt()
-        } else {
-            append("cd: pasta não encontrada: ${raw.ifEmpty { "~" }}\n", COLOR_ERR)
-        }
+        if (target?.isDirectory == true) { cwd = target; refreshLocation() }
+        else write("Pasta não encontrada: $raw\n", danger)
     }
 
-    private fun runCommand(line: String) {
-        val dir = cwd
-        worker.execute {
-            val outcome = executeShell(line, dir)
-            runOnUiThread { showOutcome(outcome) }
-        }
-    }
-
-    // Executa em background. O watchdog mata o processo se passar do tempo,
-    // o que também faz o readText() retornar, pois o stdout fecha.
-    private fun executeShell(line: String, dir: File): Outcome = try {
-        val process = ProcessBuilder(SHELL, "-c", line)
-            .directory(dir)
-            .redirectErrorStream(true)
-            .start()
-
-        val timedOut = AtomicBoolean(false)
-        Thread {
-            if (!process.waitFor(COMMAND_TIMEOUT_S, TimeUnit.SECONDS)) {
-                timedOut.set(true)
-                process.destroyForcibly()
+    private fun execute(command: String) {
+        running = true
+        status.text = "●  EXECUTANDO"
+        val directory = cwd
+        executor.execute {
+            var code = -1
+            var response = ""
+            try {
+                val process = ProcessBuilder("/system/bin/sh", "-c", command)
+                    .directory(directory).redirectErrorStream(true).start()
+                val watchdog = Thread {
+                    if (!process.waitFor(60, TimeUnit.SECONDS)) process.destroyForcibly()
+                }.apply { isDaemon = true; start() }
+                response = process.inputStream.bufferedReader().use { it.readText() }
+                code = process.waitFor()
+                watchdog.interrupt()
+            } catch (e: Exception) {
+                response = e.message ?: "Falha ao executar"
             }
-        }.apply { isDaemon = true; start() }
-
-        val output = process.inputStream.bufferedReader().readText()
-        val code = process.waitFor()
-
-        if (timedOut.get()) {
-            Outcome("$output\ntempo esgotado (${COMMAND_TIMEOUT_S}s)\n", -1)
-        } else {
-            Outcome(output, code)
-        }
-    } catch (e: Exception) {
-        Outcome(e.message ?: "falha ao executar o comando", -1)
-    }
-
-    private fun showOutcome(outcome: Outcome) {
-        if (outcome.output.isNotEmpty()) {
-            val text = if (outcome.output.endsWith("\n")) outcome.output else outcome.output + "\n"
-            append(text, if (outcome.code == 0) COLOR_FG else COLOR_ERR)
-        }
-        if (outcome.code != 0) {
-            append("[saída ${outcome.code}]\n", COLOR_DIM)
+            val result = response
+            val exitCode = code
+            runOnUiThread {
+                write(result + if (result.isNotEmpty() && !result.endsWith("\n")) "\n" else "", if (exitCode == 0) fg else danger)
+                if (exitCode != 0) write("[saída $exitCode]\n", muted)
+                running = false
+                status.text = "●  PRONTO"
+            }
         }
     }
 
-    private fun recallHistory(step: Int) {
-        if (history.isEmpty()) return
-        historyPos = (historyPos + step).coerceIn(0, history.size)
-        val text = if (historyPos < history.size) history[historyPos] else ""
-        input.setText(text)
-        input.setSelection(text.length)
+    override fun onDestroy() {
+        executor.shutdownNow()
+        super.onDestroy()
     }
 }
